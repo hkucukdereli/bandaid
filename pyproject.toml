@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "bandaid"
+version = "0.1.0"
+description = "Quick fix for banding and PMT ripple artifacts in 2p calcium imaging data"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "tifffile",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib"]
+scanimage = ["scanimage-tiff-reader"]
+all = ["bandaid[viz,scanimage]"]
+
+[tool.setuptools.packages.find]
+include = ["bandaid*"]
