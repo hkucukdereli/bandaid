@@ -1,498 +1,286 @@
 """
-TIFF I/O and ScanImage metadata utilities for calcium imaging data.
+TIFF pixel I/O: whole-stack loading, chunked streaming, and dtype-safe writing.
+
+ScanImage metadata parsing lives in :mod:`bandaid.io.scanimage`. tifffile reads
+ScanImage BigTIFFs directly, so no other reader is needed.
 """
 
-import os
-import re
-import json
+from __future__ import annotations
+
+import logging
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Union
 
 import numpy as np
-from tifffile import imread, TiffFile, TiffWriter
+from tifffile import TiffFile, TiffWriter
 
-try:
-    from ScanImageTiffReader import ScanImageTiffReader
-    HAS_SCANIMAGE_READER = True
-except ImportError:
-    HAS_SCANIMAGE_READER = False
+from bandaid._util import cast_like, package_version
+
+__all__ = [
+    "open_tiff",
+    "load_tiff_stack",
+    "iter_frames",
+    "save_tiff",
+    "TiffChunkWriter",
+    "n_channels_in_tiff",
+    "get_tiff_reader",
+]
+
+log = logging.getLogger("bandaid.io")
+
+BIGTIFF_THRESHOLD_BYTES = 3_500_000_000
+DEFAULT_MAX_CHUNK_BYTES = 256_000_000
+MAX_CHUNK_FRAMES = 1024
 
 
 # ---------------------------------------------------------------------------
-# TIFF reading
+# Reading
 # ---------------------------------------------------------------------------
 
-def get_tiff_reader(
-    filepath: Union[str, Path],
-    imaging_type: str = '2p',
-    tiff_reader: str = 'auto',
-):
-    """
-    Open a TIFF file for frame-by-frame access without loading everything.
+def n_channels_in_tiff(tif: TiffFile) -> int:
+    """Number of interleaved channels per frame (from ScanImage metadata; 1 otherwise)."""
+    if not tif.is_scanimage:
+        return 1
+    try:
+        from bandaid.io.scanimage import n_channels_from_si
 
-    Parameters
-    ----------
-    filepath : str or Path
-        Path to the TIFF file.
-    imaging_type : str, optional
-        ``'1p'`` or ``'2p'``. Controls the default reader when
-        *tiff_reader* is ``'auto'``. Default ``'2p'``.
-    tiff_reader : str, optional
-        ``'auto'``, ``'scanimage'``, or ``'tifffile'``. Default ``'auto'``.
+        return n_channels_from_si((tif.scanimage_metadata or {}).get("FrameData") or {})
+    except Exception:  # pragma: no cover - defensive
+        return 1
 
-    Returns
-    -------
-    ScanImageTiffReader or tifffile.TiffFile
 
-    Examples
-    --------
-    >>> reader = get_tiff_reader("stack.tif", tiff_reader='tifffile')
-    >>> frame_100 = reader.pages[100].asarray()
-    >>> reader.close()
-    """
-    filepath = str(filepath)
-    if tiff_reader == 'auto':
-        use_scanimage = imaging_type == '2p'
-    elif tiff_reader == 'scanimage':
-        use_scanimage = True
-    elif tiff_reader == 'tifffile':
-        use_scanimage = False
+@contextmanager
+def open_tiff(source: str | Path | TiffFile) -> Iterator[TiffFile]:
+    """Context manager yielding a :class:`tifffile.TiffFile`; accepts a path or an open file."""
+    if isinstance(source, TiffFile):
+        yield source
+        return
+    with TiffFile(str(source)) as tif:
+        yield tif
+
+
+def _frame_range(n_frames: int, frames: range | slice | None) -> range:
+    if frames is None:
+        return range(n_frames)
+    if isinstance(frames, slice):
+        rng = range(*frames.indices(n_frames))
+    elif isinstance(frames, range):
+        rng = range(max(frames.start, 0), min(frames.stop, n_frames), frames.step)
     else:
-        raise ValueError(f"Invalid tiff_reader '{tiff_reader}'")
+        raise TypeError("frames must be None, a slice, or a range")
+    if rng.step <= 0:
+        raise ValueError("frames must have a positive step")
+    return rng
 
-    if use_scanimage:
-        if not HAS_SCANIMAGE_READER:
-            raise ImportError("Install: pip install scanimage-tiff-reader")
-        return ScanImageTiffReader(filepath)
-    return TiffFile(filepath)
+
+def _page_keys(frames: range, n_ch: int, channel: int | None) -> list[int]:
+    if n_ch == 1:
+        return list(frames)
+    if channel is None:
+        return [f * n_ch + c for f in frames for c in range(n_ch)]
+    if not 0 <= channel < n_ch:
+        raise ValueError(f"channel {channel} out of range for a {n_ch}-channel file")
+    return [f * n_ch + channel for f in frames]
+
+
+def _read_pages(tif: TiffFile, frames: range, n_ch: int, channel: int | None) -> np.ndarray:
+    page0 = tif.pages[0]
+    keys = _page_keys(frames, n_ch, channel)
+    if not keys:
+        shape = (0, n_ch, *page0.shape) if (n_ch > 1 and channel is None) else (0, *page0.shape)
+        return np.empty(shape, dtype=page0.dtype)
+    out = tif.asarray(key=keys)
+    if out.ndim == 2:
+        out = out[None]
+    if n_ch > 1 and channel is None:
+        out = out.reshape(len(frames), n_ch, *out.shape[-2:])
+    return out
 
 
 def load_tiff_stack(
-    filepath: Union[str, Path],
-    imaging_type: str = '1p',
-    tiff_reader: str = 'auto',
-    verbose: bool = False,
+    filepath: str | Path | TiffFile,
+    frames: range | slice | None = None,
+    channel: int | None = None,
+    **legacy,
 ) -> np.ndarray:
     """
-    Load an entire TIFF stack into memory.
-
-    For large files, use :func:`get_tiff_reader` instead to avoid
-    loading everything at once.
+    Load a TIFF stack (or part of it) into memory.
 
     Parameters
     ----------
-    filepath : str or Path
-        Path to the TIFF file.
-    imaging_type : str, optional
-        ``'1p'`` or ``'2p'``. Default ``'1p'``.
-    tiff_reader : str, optional
-        ``'auto'``, ``'scanimage'``, or ``'tifffile'``. Default ``'auto'``.
-    verbose : bool, optional
-        Print loading info. Default ``False``.
+    filepath : str, Path, or TiffFile
+    frames : range or slice, optional
+        Frames to load (default: all).
+    channel : int, optional
+        For multi-channel ScanImage files, the channel to load. If ``None`` and
+        the file has several channels, the result has shape ``(T, C, H, W)``.
 
     Returns
     -------
     numpy.ndarray
-        Shape ``(n_frames, H, W)`` or ``(H, W)`` for single frames.
+        Shape ``(T, H, W)`` (a single-frame file gives ``T == 1``).
 
     Examples
     --------
-    >>> data = load_tiff_stack("trial.tif", imaging_type='2p')
-    >>> data.shape
-    (10000, 512, 512)
+    >>> mov = load_tiff_stack("trial.tif")
+    >>> first = load_tiff_stack("trial.tif", frames=range(0, 100))
     """
-    filepath = str(filepath)
-    if tiff_reader == 'auto':
-        use_scanimage = imaging_type == '2p'
-    elif tiff_reader == 'scanimage':
-        use_scanimage = True
-    elif tiff_reader == 'tifffile':
-        use_scanimage = False
-    else:
-        raise ValueError(f"Invalid tiff_reader '{tiff_reader}'")
-
-    if use_scanimage:
-        if not HAS_SCANIMAGE_READER:
-            raise ImportError("Install: pip install scanimage-tiff-reader")
-        if verbose:
-            print(f"Loading with ScanImageTiffReader: {os.path.basename(filepath)}")
-        return ScanImageTiffReader(filepath).data()
-    if verbose:
-        print(f"Loading with tifffile: {os.path.basename(filepath)}")
-    return imread(filepath)
+    if legacy:
+        warnings.warn(
+            f"load_tiff_stack: ignoring deprecated arguments {sorted(legacy)}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    with open_tiff(filepath) as tif:
+        n_ch = n_channels_in_tiff(tif)
+        n_frames = len(tif.pages) // n_ch
+        if frames is None and n_ch == 1:
+            out = tif.asarray()
+            return out[None] if out.ndim == 2 else out
+        return _read_pages(tif, _frame_range(n_frames, frames), n_ch, channel)
 
 
-# ---------------------------------------------------------------------------
-# TIFF writing
-# ---------------------------------------------------------------------------
-
-def save_tiff(mov: np.ndarray, fname: Union[str, Path]) -> None:
+def iter_frames(
+    source: str | Path | TiffFile,
+    chunk_frames: int | None = None,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+    frames: range | slice | None = None,
+    channel: int | None = None,
+) -> Iterator[tuple[int, np.ndarray]]:
     """
-    Save an image stack to a TIFF file (int16).
+    Stream a TIFF stack in chunks of frames without loading it whole.
 
-    Parameters
-    ----------
-    mov : numpy.ndarray
-        Stack of shape ``(n_frames, H, W)``.
-    fname : str or Path
-        Output path.
-    """
-    with TiffWriter(str(fname)) as tif:
-        for frame in np.floor(mov).astype(np.int16):
-            tif.write(frame, contiguous=True)
-
-
-# ---------------------------------------------------------------------------
-# ScanImage metadata parsing
-# ---------------------------------------------------------------------------
-
-def _parse_si_value(value: str):
-    """Convert a ScanImage value string to a Python type (bool, int, float, or str)."""
-    if value in ('true', 'false'):
-        return value == 'true'
-    if value in ('Inf', '-Inf'):
-        return float(value.replace('Inf', 'inf'))
-    if value == 'NaN':
-        return float('nan')
-    if re.match(r'^-?\d+$', value):
-        return int(value)
-    if re.match(r'^-?\d+\.?\d*(?:e[+-]?\d+)?$', value):
-        return float(value)
-    if value.startswith("'") and value.endswith("'"):
-        return value.strip("'")
-    return value
-
-
-def _parse_si_keyvalue(text: str) -> dict:
-    """Parse ``key = value`` lines into a dict."""
-    params = {}
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or '=' not in line:
-            continue
-        key, _, val = line.partition('=')
-        params[key.strip()] = _parse_si_value(val.strip())
-    return params
-
-
-def read_scanimage_metadata(filepath: Union[str, Path]) -> dict:
-    """
-    Read all ScanImage metadata from a TIFF file.
-
-    Reads three TIFF tags that ScanImage writes:
-
-    - **Software** (tag 305) — acquisition parameters (``SI.*`` key-values).
-    - **Artist** (tag 315) — ROI / scanfield geometry (JSON).
-    - **ImageDescription** (tag 270) — per-frame info (timestamps, triggers).
-
-    Parameters
-    ----------
-    filepath : str or Path
-        Path to a ScanImage TIFF.
-
-    Returns
-    -------
-    dict
-        ``'si_params'`` : dict — parsed ``SI.*`` parameters.
-        ``'roi'`` : dict or None — ROI geometry.
-        ``'frame_meta'`` : list of dict — one per frame.
-        ``'n_frames'`` : int — number of frames.
-        ``'shape'`` : tuple — ``(H, W)`` in pixels.
-        ``'dtype'`` : str — pixel type (e.g. ``'int16'``).
+    Yields ``(start_frame, chunk)`` with ``chunk`` of shape ``(n, H, W)``.
+    The chunk size defaults to about *max_chunk_bytes* of pixel data.
 
     Examples
     --------
-    >>> meta = read_scanimage_metadata("trial.tif")
-    >>> meta['si_params']['SI.hRoiManager.scanFrameRate']
-    14.49
+    >>> for start, chunk in iter_frames("trial.tif", chunk_frames=500):
+    ...     process(chunk)
     """
-    filepath = Path(filepath)
-    with TiffFile(str(filepath)) as tif:
+    with open_tiff(source) as tif:
+        n_ch = n_channels_in_tiff(tif)
         page0 = tif.pages[0]
-
-        si_params = {}
-        sw_tag = page0.tags.get('Software')
-        if sw_tag:
-            si_params = _parse_si_keyvalue(sw_tag.value)
-
-        roi = None
-        artist_tag = page0.tags.get('Artist')
-        if artist_tag:
-            try:
-                roi = json.loads(artist_tag.value)
-            except json.JSONDecodeError:
-                roi = None
-
-        frame_meta = []
-        for page in tif.pages:
-            frame_meta.append(_parse_si_keyvalue(page.description))
-
-        shape = page0.shape
-        dtype = page0.dtype
-
-    return {
-        'si_params': si_params,
-        'roi': roi,
-        'frame_meta': frame_meta,
-        'n_frames': len(frame_meta),
-        'shape': shape,
-        'dtype': str(dtype),
-    }
-
-
-def _extract_acquisition(si_params: dict) -> dict:
-    """Pick the commonly used acquisition fields from the raw SI parameters."""
-    g = si_params.get
-
-    version_parts = [
-        g('SI.VERSION_MAJOR', ''),
-        g('SI.VERSION_MINOR', ''),
-        g('SI.VERSION_UPDATE', ''),
-    ]
-    version = '.'.join(str(v) for v in version_parts)
-
-    return {
-        'scanimage_version': version,
-        'acq_state': g('SI.acqState', ''),
-        'frame_rate_hz': g('SI.hRoiManager.scanFrameRate', None),
-        'pixels_per_line': g('SI.hRoiManager.pixelsPerLine', None),
-        'lines_per_frame': g('SI.hRoiManager.linesPerFrame', None),
-        'line_period_s': g('SI.hRoiManager.linePeriod', None),
-        'zoom': g('SI.hRoiManager.scanZoomFactor', None),
-        'fov_deg': g('SI.hRoiManager.imagingFovDeg', None),
-        'fov_um': g('SI.hRoiManager.imagingFovUm', None),
-        'bidirectional': g('SI.hScan2D.bidirectional', None),
-        'fill_fraction': g('SI.hScan2D.fillFractionSpatial', None),
-        'scanner_type': g('SI.hScan2D.scannerType', None),
-        'scanner_frequency_hz': g('SI.hScan2D.scannerFrequency', None),
-        'n_channels_available': g('SI.hChannels.channelsAvailable', None),
-        'channels_saved': g('SI.hChannels.channelSave', None),
-        'channel_offsets': g('SI.hChannels.channelOffset', None),
-        'laser_power_percent': g('SI.hBeams.powers', None),
-        'laser_power_fraction': g('SI.hBeams.powerFractions', None),
-        'motor_position': g('SI.hMotors.axesPosition', None),
-        'fastz_enabled': g('SI.hFastZ.enable', None),
-        'z_step_um': g('SI.hStackManager.actualStackZStepSize', None),
-    }
-
-
-def _extract_frames(frame_meta: list[dict]) -> dict:
-    """Reorganize per-frame metadata from a list-of-dicts into a dict-of-lists."""
-    if not frame_meta:
-        return {}
-
-    frame_numbers = []
-    frame_numbers_acquisition = []
-    timestamps_sec = []
-    acq_trigger_sec = []
-
-    for fm in frame_meta:
-        frame_numbers.append(fm.get('frameNumbers', None))
-        frame_numbers_acquisition.append(fm.get('frameNumberAcquisition', None))
-        timestamps_sec.append(fm.get('frameTimestamps_sec', None))
-        acq_trigger_sec.append(fm.get('acqTriggerTimestamps_sec', None))
-
-    epoch = frame_meta[0].get('epoch', None)
-
-    return {
-        'frame_numbers': frame_numbers,
-        'frame_numbers_acquisition': frame_numbers_acquisition,
-        'timestamps_sec': timestamps_sec,
-        'acq_trigger_timestamps_sec': acq_trigger_sec,
-        'epoch': epoch,
-    }
+        n_frames = len(tif.pages) // n_ch
+        rng = _frame_range(n_frames, frames)
+        if chunk_frames is None:
+            per_frame = page0.nbytes * (n_ch if channel is None else 1)
+            chunk_frames = int(max(1, min(MAX_CHUNK_FRAMES, max_chunk_bytes // max(per_frame, 1))))
+        idx = list(rng)
+        for s in range(0, len(idx), chunk_frames):
+            sub = idx[s : s + chunk_frames]
+            sub_rng = range(sub[0], sub[-1] + rng.step, rng.step)
+            yield sub[0], _read_pages(tif, sub_rng, n_ch, channel)
 
 
 # ---------------------------------------------------------------------------
-# Session metadata
+# Writing
 # ---------------------------------------------------------------------------
 
-def save_session_metadata(
-    session_dir: Union[str, Path],
-    output_path: Union[str, Path, None] = None,
-    mouse: str | None = None,
-    date: str | None = None,
-    session_id: str | None = None,
+class TiffChunkWriter:
+    """
+    Write a ``(T, H, W)`` stack to a TIFF one chunk at a time.
+
+    Frames are cast to *dtype* with rounding and clipping (never wraparound).
+    BigTIFF is used when the expected size is unknown or exceeds ~3.5 GB.
+
+    Examples
+    --------
+    >>> with TiffChunkWriter("out.tif", dtype="int16") as w:
+    ...     for start, chunk in iter_frames("in.tif"):
+    ...         w.write_chunk(chunk.astype("float32") - 3.2)
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        dtype,
+        bigtiff: bool | None = None,
+        expected_nbytes: int | None = None,
+        software: str | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.dtype = np.dtype(dtype)
+        if bigtiff is None:
+            bigtiff = expected_nbytes is None or expected_nbytes > BIGTIFF_THRESHOLD_BYTES
+        self.bigtiff = bool(bigtiff)
+        self.software = software or f"bandaid {package_version()}"
+        self._tif: TiffWriter | None = None
+        self.n_frames = 0
+
+    def __enter__(self) -> TiffChunkWriter:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._tif = TiffWriter(str(self.path), bigtiff=self.bigtiff)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._tif is not None:
+            self._tif.close()
+            self._tif = None
+
+    def write_chunk(self, chunk: np.ndarray) -> None:
+        if self._tif is None:
+            raise RuntimeError("TiffChunkWriter must be used as a context manager")
+        chunk = np.asarray(chunk)
+        if chunk.ndim == 2:
+            chunk = chunk[None]
+        if chunk.ndim != 3:
+            raise ValueError(f"expected (n, H, W) chunk, got shape {chunk.shape}")
+        if chunk.shape[0] == 0:
+            return
+        chunk = np.ascontiguousarray(cast_like(chunk, self.dtype))
+        kwargs = dict(photometric="minisblack", contiguous=True, metadata=None)
+        if self.n_frames == 0:
+            kwargs["software"] = self.software
+        self._tif.write(chunk, **kwargs)
+        self.n_frames += chunk.shape[0]
+
+
+def save_tiff(
+    data: np.ndarray,
+    path: str | Path,
+    dtype=None,
+    bigtiff: bool | None = None,
+    chunk_frames: int | None = None,
+    software: str | None = None,
 ) -> Path:
     """
-    Collect metadata from all TIFFs in a session folder into one JSON file.
+    Save a ``(T, H, W)`` or ``(H, W)`` array to a TIFF.
 
-    Writes shared acquisition parameters once, then per-file frame data
-    (timestamps, frame numbers). Warns if parameters differ between files
-    or if a recording was interrupted.
+    The input dtype is kept unless *dtype* is given. Integer targets are
+    rounded and clipped rather than truncated or wrapped.
 
-    See ``session_metadata_format.md`` for the full JSON schema.
-
-    Parameters
-    ----------
-    session_dir : str or Path
-        Folder with one or more TIFF files from a single session.
-    output_path : str, Path, or None, optional
-        Output JSON path. Defaults to ``session_dir/session_metadata.json``.
-    mouse : str or None, optional
-        Mouse ID. Inferred from folder name if not given.
-    date : str or None, optional
-        Date (YYYYMMDD). Inferred from folder name if not given.
-    session_id : str or None, optional
-        Session identifier. Inferred from folder name if not given.
-
-    Returns
-    -------
-    pathlib.Path
-        Path to the written JSON file.
-
-    Examples
-    --------
-    >>> save_session_metadata("/data/AMD8/AMD8_20260618/AMD8_20260618_002")
-    Session metadata saved to: .../session_metadata.json (918.4 KB)
-      1 file(s), 13042 total frames
+    Returns the output path.
     """
-    session_dir = Path(session_dir)
-    tiff_paths = sorted(session_dir.glob('*.tif')) + sorted(session_dir.glob('*.tiff'))
-    if not tiff_paths:
-        raise FileNotFoundError(f"No TIFF files found in {session_dir}")
-
-    # Infer session identifiers from folder name
-    if mouse is None or date is None:
-        parts = session_dir.name.split('_')
-        if mouse is None and len(parts) >= 1:
-            mouse = parts[0]
-        if date is None and len(parts) >= 2:
-            date = parts[1]
-        if session_id is None and len(parts) >= 3:
-            session_id = parts[2]
-
-    # Read metadata from all files
-    all_file_meta = []
-    all_si_params = []
-    shared_roi = None
-
-    for tp in tiff_paths:
-        meta = read_scanimage_metadata(tp)
-        all_file_meta.append((tp, meta))
-        all_si_params.append(meta['si_params'])
-        if shared_roi is None:
-            shared_roi = meta['roi']
-
-    # Validate that acquisition params are consistent across files
-    if len(all_si_params) > 1:
-        baseline = all_si_params[0]
-        for i, params in enumerate(all_si_params[1:], 1):
-            diffs = {}
-            for key in set(baseline) | set(params):
-                v0 = baseline.get(key)
-                vi = params.get(key)
-                if v0 != vi:
-                    diffs[key] = {'file_0': v0, f'file_{i}': vi}
-            if diffs:
-                diff_keys = ', '.join(diffs.keys())
-                warnings.warn(
-                    f"SI params differ between {tiff_paths[0].name} and "
-                    f"{tiff_paths[i].name}: {diff_keys}"
-                )
-
-    # Build session JSON
-    first_si = all_si_params[0]
-    acquisition = _extract_acquisition(first_si)
-
-    total_frames = 0
-    file_entries = []
-
-    for tp, meta in all_file_meta:
-        frames = _extract_frames(meta['frame_meta'])
-        n_frames_actual = meta['n_frames']
-        total_frames += n_frames_actual
-
-        last_fm = meta['frame_meta'][-1] if meta['frame_meta'] else {}
-        acq_complete = last_fm.get('endOfAcquisition', 0) == 1
-
-        last_fna = last_fm.get('frameNumberAcquisition', None)
-        if last_fna is not None and int(last_fna) != n_frames_actual:
-            warnings.warn(
-                f"{tp.name}: frame count mismatch — file has {n_frames_actual} "
-                f"pages but last frameNumberAcquisition is {last_fna}"
-            )
-
-        file_entry = {
-            'filename': tp.name,
-            'n_frames': n_frames_actual,
-            'acquisition_complete': acq_complete,
-            'shape': list(meta['shape']),
-            'dtype': meta['dtype'],
-            'frames': frames,
-        }
-        file_entries.append(file_entry)
-
-    session_json = {
-        'session': {
-            'mouse': mouse,
-            'date': date,
-            'session_id': session_id,
-            'n_files': len(tiff_paths),
-            'total_frames': total_frames,
-        },
-        'acquisition': acquisition,
-        'roi': shared_roi,
-        'files': file_entries,
-    }
-
-    # Write
-    if output_path is None:
-        output_path = session_dir / 'session_metadata.json'
-    output_path = Path(output_path)
-
-    with open(output_path, 'w') as f:
-        json.dump(session_json, f, indent=2, default=_json_default)
-
-    incomplete = [f['filename'] for f in file_entries if not f['acquisition_complete']]
-    print(f"Session metadata saved to: {output_path} ({output_path.stat().st_size / 1024:.1f} KB)")
-    print(f"  {len(tiff_paths)} file(s), {total_frames} total frames")
-    if incomplete:
-        print(f"  WARNING: incomplete acquisition in: {', '.join(incomplete)}")
-
-    return output_path
+    data = np.asarray(data)
+    if data.ndim == 2:
+        data = data[None]
+    if data.ndim != 3:
+        raise ValueError(f"expected (T, H, W) or (H, W), got shape {data.shape}")
+    target = np.dtype(dtype) if dtype is not None else data.dtype
+    nbytes = int(np.prod(data.shape)) * target.itemsize
+    if chunk_frames is None:
+        chunk_frames = int(max(1, DEFAULT_MAX_CHUNK_BYTES // max(data[0].nbytes, 1)))
+    with TiffChunkWriter(path, target, bigtiff=bigtiff, expected_nbytes=nbytes, software=software) as w:
+        for s in range(0, data.shape[0], chunk_frames):
+            w.write_chunk(data[s : s + chunk_frames])
+    return Path(path)
 
 
-def load_session_metadata(path: Union[str, Path]) -> dict:
-    """
-    Load a ``session_metadata.json`` file.
+# ---------------------------------------------------------------------------
+# Deprecated
+# ---------------------------------------------------------------------------
 
-    Parameters
-    ----------
-    path : str or Path
-        Path to the JSON file, or a session folder containing one.
-
-    Returns
-    -------
-    dict
-        Session metadata (see ``session_metadata_format.md``).
-
-    Examples
-    --------
-    >>> meta = load_session_metadata("/data/AMD8_20260618_002")
-    >>> meta['session']['total_frames']
-    13042
-    """
-    path = Path(path)
-    if path.is_dir():
-        path = path / 'session_metadata.json'
-    with open(path) as f:
-        return json.load(f)
-
-
-def _json_default(obj):
-    """Handle numpy types during JSON serialization."""
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        if np.isnan(obj):
-            return None
-        if np.isinf(obj):
-            return str(obj)
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.dtype):
-        return str(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+def get_tiff_reader(filepath: str | Path, **legacy) -> TiffFile:
+    """Deprecated: use :func:`open_tiff` or :class:`tifffile.TiffFile` directly."""
+    warnings.warn(
+        "get_tiff_reader is deprecated; use open_tiff() or tifffile.TiffFile",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return TiffFile(str(filepath))

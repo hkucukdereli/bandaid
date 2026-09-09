@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# bandaid: local example data and macOS junk
+data/
+.DS_Store
+*.tif
+*.tiff
